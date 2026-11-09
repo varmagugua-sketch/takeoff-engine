@@ -1,4 +1,4 @@
- """
+"""
 main.py - FastAPI microservice for the Takeoff Pipeline (Day 1: slicing).
 
 Endpoints
@@ -37,6 +37,7 @@ from slicer import (
     open_pdf,
     plan_header,
     plan_tiles,
+    render_legend,
     tile_meta,
 )
 
@@ -159,6 +160,16 @@ def _zip_job(path: str, cfg: SliceConfig, workdir: str) -> str:
                 zf.writestr(name, t.png)
                 metas.append(tile_meta(t, name))
             manifest = {**plan_header(plan), "tiles": metas}
+            if plan.legend is not None:
+                try:
+                    lg = render_legend(page, plan.legend, cfg)
+                    zf.writestr("legend.png", lg.png)
+                    manifest["legend"]["file"] = "legend.png"
+                    manifest["legend"]["width_px"] = lg.width_px
+                    manifest["legend"]["height_px"] = lg.height_px
+                    manifest["legend"]["render_dpi"] = lg.dpi
+                except Exception:
+                    log.exception("Legend crop render failed; ZIP continues without it.")
             zf.writestr("manifest.json", json.dumps(manifest, indent=2))
         return zip_path
     finally:

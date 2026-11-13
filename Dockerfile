@@ -1,18 +1,13 @@
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
-
 WORKDIR /app
 
+# Copy requirements first so Docker caches dependencies cleanly
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy all application Python modules
 COPY main.py slicer.py excel_builder.py gemini_client.py ./
-RUN pip install -r requirements.txt
 
-COPY main.py slicer.py ./
-
-RUN useradd -m appuser
-USER appuser
-
-# Render injects $PORT. One worker only: free tier has 512 MB RAM.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
+# Render sets the PORT environment variable automatically
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

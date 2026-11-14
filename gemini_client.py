@@ -4,14 +4,12 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
-# ---------------------------------------------------------
-# 1. PYDANTIC DATA SCHEMAS (Strict JSON Output Contract)
-# ---------------------------------------------------------
 
 class SymbolCoordinate(BaseModel):
     """Exact center pixel location of a detected symbol inside a grid tile."""
     x: int = Field(description="Center X pixel coordinate of the symbol on this grid tile.")
     y: int = Field(description="Center Y pixel coordinate of the symbol on this grid tile.")
+
 
 class SymbolDetection(BaseModel):
     """Count and locations for a single symbol type matching the agency's legend."""
@@ -21,6 +19,7 @@ class SymbolDetection(BaseModel):
         default_factory=list,
         description="List of center X/Y pixel coordinates for every detected instance."
     )
+
 
 class TileAnalysisResult(BaseModel):
     """Master structured output returned for one 4x4 matrix tile."""
@@ -32,17 +31,12 @@ class TileAnalysisResult(BaseModel):
     )
 
 
-# ---------------------------------------------------------
-# 2. GEMINI VISION ENGINE CLIENT
-# ---------------------------------------------------------
-
 class GeminiTakeoffClient:
     def __init__(self):
-        # Automatically reads GEMINI_API_KEY from Codespaces Secrets or Render Env Vars
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("Missing GEMINI_API_KEY environment variable.")
-        
+
         self.client = genai.Client(api_key=api_key)
         self.model_id = "gemini-2.5-pro"
 
@@ -53,10 +47,6 @@ class GeminiTakeoffClient:
         page_number: int,
         tile_index: int
     ) -> TileAnalysisResult:
-        """
-        Sends the agency's manual Legend image alongside one high-res blueprint grid tile.
-        Forces Gemini to count ONLY symbols defined in the Legend image and return local X/Y coordinates.
-        """
         if not os.path.exists(tile_path):
             raise FileNotFoundError(f"Grid tile not found: {tile_path}")
         if not os.path.exists(legend_path):
@@ -87,7 +77,7 @@ class GeminiTakeoffClient:
         5. Return strictly valid JSON matching the required schema for Page {page_number}, Tile {tile_index}.
         """
 
-                legend_mime = "image/jpeg" if legend_bytes[:3] == b"\xff\xd8\xff" else "image/png"
+        legend_mime = "image/jpeg" if legend_bytes[:3] == b"\xff\xd8\xff" else "image/png"
         legend_part = types.Part.from_bytes(data=legend_bytes, mime_type=legend_mime)
         tile_part = types.Part.from_bytes(data=tile_bytes, mime_type="image/png")
 

@@ -87,7 +87,8 @@ class GeminiTakeoffClient:
         5. Return strictly valid JSON matching the required schema for Page {page_number}, Tile {tile_index}.
         """
 
-        legend_part = types.Part.from_bytes(data=legend_bytes, mime_type="image/png")
+                legend_mime = "image/jpeg" if legend_bytes[:3] == b"\xff\xd8\xff" else "image/png"
+        legend_part = types.Part.from_bytes(data=legend_bytes, mime_type=legend_mime)
         tile_part = types.Part.from_bytes(data=tile_bytes, mime_type="image/png")
 
         response = self.client.models.generate_content(

@@ -1,8 +1,21 @@
+import logging
 import os
 from typing import List
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
+
+log = logging.getLogger("gemini_client")
+
+PREFERRED_MODELS = [
+    "gemini-flash-latest",
+    "gemini-3-flash-preview",
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-pro-latest",
+    "gemini-3-pro-preview",
+]
 
 
 class SymbolCoordinate(BaseModel):
@@ -37,8 +50,37 @@ class GeminiTakeoffClient:
         if not api_key:
             raise ValueError("Missing GEMINI_API_KEY environment variable.")
 
-        self.client = genai.Client(api_key=api_key)
-        self.model_id = "gemini-2.5-pro"
+        # Use v1beta so structured outputs (response_schema) and latest models work
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(api_version="v1beta"),
+        )
+        self._candidates = self._build_candidate_models()
+        self.model_id = self._candidates[0]
+        log.info("Initialized Gemini client on v1beta (initial model: %s)", self.model_id)
+
+    def _build_candidate_models(self) -> List[str]:
+        candidates: List[str] = []
+        env_model = os.getenv("GEMINI_MODEL", "").strip()
+        if env_model:
+            candidates.append(env_model.replace("models/", ""))
+
+        for m in PREFERRED_MODELS:
+            if m not in candidates:
+                candidates.append(m)
+
+        try:
+            skip = ("embedding", "imagen", "veo", "tts", "audio", "aqa", "robotics", "computer-use", "gemma")
+            for model in self.client.models.list():
+                raw = getattr(model, "name", "") or ""
+                short = raw.replace("models/", "")
+                if short.startswith("gemini") and not any(s in short.lower() for s in skip):
+                    if short not in candidates:
+                        candidates.append(short)
+        except Exception as exc:
+            log.warning("Model list lookup skipped: %s", exc)
+
+        return candidates
 
     def analyze_tile_with_legend(
         self,
@@ -81,15 +123,35 @@ class GeminiTakeoffClient:
         legend_part = types.Part.from_bytes(data=legend_bytes, mime_type=legend_mime)
         tile_part = types.Part.from_bytes(data=tile_bytes, mime_type="image/png")
 
-        response = self.client.models.generate_content(
-            model=self.model_id,
-            contents=[legend_part, tile_part, prompt],
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.1,
-                response_mime_type="application/json",
-                response_schema=TileAnalysisResult,
-            ),
-        )
+        last_err = None
+        for candidate in list(self._candidates):
+            try:
+                response = self.client.models.generate_content(
+                    model=candidate,
+                    contents=[legend_part, tile_part, prompt],
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                        response_schema=TileAnalysisResult,
+                    ),
+                )
+                if candidate != self.model_id:
+                    log.info("Switched to working Gemini model: %s", candidate)
+                    self.model_id = candidate
+                if response.parsed is not None:
+                    return response.parsed
+                if response.text:
+                    return TileAnalysisResult.model_validate_json(response.text)
+                return TileAnalysisResult(page_number=page_number, tile_index=tile_index, detections=[])
+            except Exception as exc:
+                msg = str(exc)
+                if "404" in msg or "not found" in msg.lower():
+                    log.warning("Model %s returned 404 on v1beta; trying next model...", candidate)
+                    if len(self._candidates) > 1:
+                        self._candidates.remove(candidate)
+                    last_err = exc
+                    continue
+                raise
 
-        return response.parsed
+        raise last_err

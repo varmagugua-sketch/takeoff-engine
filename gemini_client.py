@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from typing import List
 from pydantic import BaseModel, Field
 from google import genai
@@ -8,13 +9,13 @@ from google.genai import types
 log = logging.getLogger("gemini_client")
 
 PREFERRED_MODELS = [
-    "gemini-flash-latest",
-    "gemini-3-flash-preview",
-    "gemini-3-flash",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-3-flash-preview",
+    "gemini-2.0-flash-lite",
     "gemini-pro-latest",
-    "gemini-3-pro-preview",
 ]
 
 
@@ -50,14 +51,13 @@ class GeminiTakeoffClient:
         if not api_key:
             raise ValueError("Missing GEMINI_API_KEY environment variable.")
 
-        # Use v1beta so structured outputs (response_schema) and latest models work
         self.client = genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(api_version="v1beta"),
         )
         self._candidates = self._build_candidate_models()
         self.model_id = self._candidates[0]
-        log.info("Initialized Gemini client on v1beta (initial model: %s)", self.model_id)
+        log.info("Initialized Gemini client on v1beta (candidates: %s)", self._candidates[:5])
 
     def _build_candidate_models(self) -> List[str]:
         candidates: List[str] = []
@@ -137,20 +137,31 @@ class GeminiTakeoffClient:
                     ),
                 )
                 if candidate != self.model_id:
-                    log.info("Switched to working Gemini model: %s", candidate)
+                    log.info("Locked onto responsive Gemini model: %s", candidate)
                     self.model_id = candidate
+                    # Move working model to front of list for all future tiles!
+                    self._candidates.remove(candidate)
+                    self._candidates.insert(0, candidate)
+
                 if response.parsed is not None:
                     return response.parsed
                 if response.text:
                     return TileAnalysisResult.model_validate_json(response.text)
                 return TileAnalysisResult(page_number=page_number, tile_index=tile_index, detections=[])
+
             except Exception as exc:
-                msg = str(exc)
-                if "404" in msg or "not found" in msg.lower():
-                    log.warning("Model %s returned 404 on v1beta; trying next model...", candidate)
+                msg = str(exc).lower()
+                last_err = exc
+                # Permanently drop 404/unsupported models from candidate list
+                if "404" in msg or "not found" in msg or "not supported" in msg:
+                    log.warning("Model %s unavailable (404); removing from pool.", candidate)
                     if len(self._candidates) > 1:
                         self._candidates.remove(candidate)
-                    last_err = exc
+                    continue
+                # Temporarily hop to next model on 503 high-demand or 429 rate-limit!
+                if "503" in msg or "unavailable" in msg or "429" in msg or "exhausted" in msg or "overloaded" in msg:
+                    log.warning("Model %s busy (503/429); hopping to next candidate...", candidate)
+                    time.sleep(1.5)
                     continue
                 raise
 

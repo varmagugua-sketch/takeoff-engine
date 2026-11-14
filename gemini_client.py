@@ -8,14 +8,13 @@ from google.genai import types
 
 log = logging.getLogger("gemini_client")
 
+# Strictly fast multimodal Flash models (no slow Pro models that hang background workers)
 PREFERRED_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-flash-latest",
     "gemini-3-flash-preview",
-    "gemini-2.0-flash-lite",
-    "gemini-pro-latest",
+    "gemini-2.0-flash",
+    "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
 ]
 
 
@@ -51,36 +50,14 @@ class GeminiTakeoffClient:
         if not api_key:
             raise ValueError("Missing GEMINI_API_KEY environment variable.")
 
+        # 60,000 ms (60s) hard HTTP timeout so a stalled connection never freezes the job!
         self.client = genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(api_version="v1beta"),
+            http_options=types.HttpOptions(api_version="v1beta", timeout=60_000),
         )
-        self._candidates = self._build_candidate_models()
+        self._candidates = list(PREFERRED_MODELS)
         self.model_id = self._candidates[0]
-        log.info("Initialized Gemini client on v1beta (candidates: %s)", self._candidates[:5])
-
-    def _build_candidate_models(self) -> List[str]:
-        candidates: List[str] = []
-        env_model = os.getenv("GEMINI_MODEL", "").strip()
-        if env_model:
-            candidates.append(env_model.replace("models/", ""))
-
-        for m in PREFERRED_MODELS:
-            if m not in candidates:
-                candidates.append(m)
-
-        try:
-            skip = ("embedding", "imagen", "veo", "tts", "audio", "aqa", "robotics", "computer-use", "gemma")
-            for model in self.client.models.list():
-                raw = getattr(model, "name", "") or ""
-                short = raw.replace("models/", "")
-                if short.startswith("gemini") and not any(s in short.lower() for s in skip):
-                    if short not in candidates:
-                        candidates.append(short)
-        except Exception as exc:
-            log.warning("Model list lookup skipped: %s", exc)
-
-        return candidates
+        log.info("Initialized Gemini client (60s timeout) with pool: %s", self._candidates)
 
     def analyze_tile_with_legend(
         self,
@@ -123,46 +100,44 @@ class GeminiTakeoffClient:
         legend_part = types.Part.from_bytes(data=legend_bytes, mime_type=legend_mime)
         tile_part = types.Part.from_bytes(data=tile_bytes, mime_type="image/png")
 
+        log.info("Analyzing Page %d Tile %d/15...", page_number, tile_index)
+
         last_err = None
-        for candidate in list(self._candidates):
-            try:
-                response = self.client.models.generate_content(
-                    model=candidate,
-                    contents=[legend_part, tile_part, prompt],
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=0.1,
-                        response_mime_type="application/json",
-                        response_schema=TileAnalysisResult,
-                    ),
-                )
-                if candidate != self.model_id:
-                    log.info("Locked onto responsive Gemini model: %s", candidate)
-                    self.model_id = candidate
-                    # Move working model to front of list for all future tiles!
-                    self._candidates.remove(candidate)
-                    self._candidates.insert(0, candidate)
-
-                if response.parsed is not None:
-                    return response.parsed
-                if response.text:
-                    return TileAnalysisResult.model_validate_json(response.text)
-                return TileAnalysisResult(page_number=page_number, tile_index=tile_index, detections=[])
-
-            except Exception as exc:
-                msg = str(exc).lower()
-                last_err = exc
-                # Permanently drop 404/unsupported models from candidate list
-                if "404" in msg or "not found" in msg or "not supported" in msg:
-                    log.warning("Model %s unavailable (404); removing from pool.", candidate)
-                    if len(self._candidates) > 1:
+        # Two full passes across our fast Flash pool so brief 503 spikes never stall
+        for attempt_round in range(2):
+            for candidate in list(self._candidates):
+                try:
+                    response = self.client.models.generate_content(
+                        model=candidate,
+                        contents=[legend_part, tile_part, prompt],
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_instruction,
+                            temperature=0.1,
+                            response_mime_type="application/json",
+                            response_schema=TileAnalysisResult,
+                        ),
+                    )
+                    if candidate != self.model_id:
+                        self.model_id = candidate
                         self._candidates.remove(candidate)
+                        self._candidates.insert(0, candidate)
+
+                    if response.parsed is not None:
+                        return response.parsed
+                    if response.text:
+                        return TileAnalysisResult.model_validate_json(response.text)
+                    return TileAnalysisResult(page_number=page_number, tile_index=tile_index, detections=[])
+
+                except Exception as exc:
+                    msg = str(exc).lower()
+                    last_err = exc
+                    if "404" in msg or "not found" in msg or "not supported" in msg:
+                        log.warning("Model %s returned 404; dropping from pool.", candidate)
+                        if len(self._candidates) > 1:
+                            self._candidates.remove(candidate)
+                        continue
+                    log.warning("Page %d Tile %d on %s temporary error (%s); trying next...", page_number, tile_index, candidate, type(exc).__name__)
+                    time.sleep(2.0)
                     continue
-                # Temporarily hop to next model on 503 high-demand or 429 rate-limit!
-                if "503" in msg or "unavailable" in msg or "429" in msg or "exhausted" in msg or "overloaded" in msg:
-                    log.warning("Model %s busy (503/429); hopping to next candidate...", candidate)
-                    time.sleep(1.5)
-                    continue
-                raise
 
         raise last_err

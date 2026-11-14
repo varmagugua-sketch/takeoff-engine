@@ -6,12 +6,26 @@ Endpoints
   POST /process-takeoff   -> 202 Accepted immediately; the job runs in a background task
                              JSON body (TakeoffJobRequest):
                                {"pdf_file_id": "...", "pdf_filename": "...",
-                                "legend_file_id": "...", "finished_folder_id": "..."}
+                                "legend_file_id": "...", "finished_folder_id": "...",
+                                "output_pdf_file_id": "..."   (optional),
+                                "output_xlsx_file_id": "..."  (optional)}
   GET  /status            -> progress of the running / last job (auth if API_KEY set)
 
 No file ever travels in the HTTP request. The worker downloads the blueprint and the
 legend from Google Drive (MediaIoBaseDownload, streamed to disk), so there is no
 request-size ceiling; the practical limits are RAM and temp disk (see MAX_PDF_MB).
+
+Output modes (service accounts on a personal Gmail have ZERO storage quota, so files.create()
+fails with 403 storageQuotaExceeded):
+  * placeholder mode  - Apps Script creates empty files inside the finished folder (owned by the
+                        user, shared with the service account as Editor) and sends their IDs as
+                        output_pdf_file_id / output_xlsx_file_id. We then call files().update()
+                        to replace their CONTENT, which is charged to the file owner, not to the
+                        service account.
+  * create mode       - no placeholder ID given for an output -> files().create() in
+                        finished_folder_id (works on Shared Drives / Workspace / OAuth fallback).
+Each output is chosen independently. Failure-notice text files use create(); a 403 there is
+logged and skipped.
 
 Pipeline (one job at a time, guarded by asyncio.BoundedSemaphore(1)):
   download -> for every page: 4x4 tiles @300 DPI -> GeminiTakeoffClient.analyze_tile_with_legend
@@ -50,7 +64,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
 
 import excel_builder
@@ -141,6 +155,8 @@ class TakeoffJobRequest(BaseModel):
     pdf_filename: str = Field(default="blueprint.pdf", max_length=255)
     legend_file_id: str = Field(..., min_length=10, max_length=128)
     finished_folder_id: str = Field(..., min_length=10, max_length=128)
+    output_pdf_file_id: Optional[str] = None
+    output_xlsx_file_id: Optional[str] = None
 
     @field_validator("pdf_file_id", "legend_file_id", "finished_folder_id")
     @classmethod
@@ -149,6 +165,27 @@ class TakeoffJobRequest(BaseModel):
         if not _DRIVE_ID_RE.match(v):
             raise ValueError("not a valid Google Drive ID")
         return v
+
+    @field_validator("output_pdf_file_id", "output_xlsx_file_id", mode="before")
+    @classmethod
+    def _optional_drive_id(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or s.lower() in ("null", "none", "undefined"):
+            return None
+        if not _DRIVE_ID_RE.match(s):
+            raise ValueError("not a valid Google Drive ID")
+        return s
+
+    @model_validator(mode="after")
+    def _outputs_must_not_clobber_inputs(self) -> "TakeoffJobRequest":
+        ids = [i for i in (self.output_pdf_file_id, self.output_xlsx_file_id) if i]
+        if len(set(ids)) != len(ids):
+            raise ValueError("output_pdf_file_id and output_xlsx_file_id must be different files")
+        if any(i in (self.pdf_file_id, self.legend_file_id, self.finished_folder_id) for i in ids):
+            raise ValueError("an output file ID must not be the input PDF, the legend, or the folder")
+        return self
 
     @field_validator("pdf_filename", mode="before")
     @classmethod
@@ -239,7 +276,9 @@ def _explain_drive_http(status: int, exc: Any) -> str:
         pass
     if "storageQuota" in body or "storage quota" in body.lower():
         return ("Google refused the upload: service accounts have no storage quota in a normal "
-                "My Drive folder. Use a Shared Drive folder, or set the GOOGLE_OAUTH_* variables.")
+                "My Drive folder. Send output_pdf_file_id / output_xlsx_file_id (empty placeholder "
+                "files shared with the service account) so the content is updated in place, or "
+                "use a Shared Drive folder.")
     if "fileNotDownloadable" in body or "cannotDownloadFile" in body:
         return "Google does not allow this file to be downloaded."
     if status == 404:
@@ -254,7 +293,7 @@ def _file_meta(svc: Any, file_id: str, label: str) -> Dict[str, Any]:
     try:
         meta = svc.files().get(
             fileId=file_id,
-            fields="id,name,mimeType,size,trashed,capabilities(canDownload,canAddChildren)",
+            fields="id,name,mimeType,size,trashed,capabilities(canDownload,canAddChildren,canEdit)",
             supportsAllDrives=True,
         ).execute(num_retries=2)
     except HttpError as exc:
@@ -296,6 +335,20 @@ def _check_folder(svc: Any, folder_id: str) -> None:
     if (meta.get("capabilities") or {}).get("canAddChildren") is False:
         raise DriveError("finished_folder_id: the service account can view this folder but cannot "
                          "add files (share it as Editor).", 403)
+
+
+def _check_placeholder(svc: Any, file_id: str, label: str) -> None:
+    """An output placeholder must be an ordinary, editable, non-folder file."""
+    meta = _file_meta(svc, file_id, label)
+    mime = str(meta.get("mimeType") or "")
+    if mime == DRIVE_FOLDER_MIME:
+        raise DriveError(f"{label}: this is a folder, not a file.", 400)
+    if mime.startswith("application/vnd.google-apps."):
+        raise DriveError(f"{label}: native Google files (Docs/Sheets/Slides) cannot be overwritten "
+                         f"with a PDF/XLSX; create a plain empty file instead.", 422)
+    if (meta.get("capabilities") or {}).get("canEdit") is False:
+        raise DriveError(f"{label}: the service account cannot edit this file "
+                         f"(share its folder with the service account as Editor).", 403)
 
 
 def _ensure_disk(path: str, needed_bytes: int) -> None:
@@ -343,34 +396,51 @@ def _download_file(svc: Any, file_id: str, dest: str, max_bytes: int, label: str
     raise DriveError(f"{label}: download failed after 3 attempts ({type(last).__name__}).", 502)
 
 
-def _upload_file(service: Any, path: str, name: str, mime: str, folder_id: str) -> Dict[str, Any]:
+def _upload_file(service: Any, path: str, name: str, mime: str, folder_id: str,
+                 existing_file_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Upload one deliverable.
+      existing_file_id given -> files().update(fileId=..., media_body=...) replaces the content of
+                                a placeholder the user owns (no service-account storage quota used).
+      otherwise              -> files().create() inside folder_id.
+    """
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaFileUpload
 
+    mode = "update" if existing_file_id else "create"
     last: Optional[Exception] = None
     for attempt in range(1, 4):
         try:
             media = MediaFileUpload(path, mimetype=mime, resumable=True, chunksize=8 * MB)
-            req = service.files().create(
-                body={"name": name, "parents": [folder_id]},
-                media_body=media,
-                fields="id,name,webViewLink,size",
-                supportsAllDrives=True,
-            )
+            if existing_file_id:
+                req = service.files().update(
+                    fileId=existing_file_id,
+                    media_body=media,
+                    fields="id,name,webViewLink,size",
+                    supportsAllDrives=True,
+                )
+            else:
+                req = service.files().create(
+                    body={"name": name, "parents": [folder_id]},
+                    media_body=media,
+                    fields="id,name,webViewLink,size",
+                    supportsAllDrives=True,
+                )
             resp = None
             while resp is None:
                 _status, resp = req.next_chunk(num_retries=3)
-            return {"name": resp.get("name", name), "id": resp.get("id"), "link": resp.get("webViewLink")}
+            return {"name": resp.get("name", name), "id": resp.get("id"),
+                    "link": resp.get("webViewLink"), "mode": mode}
         except HttpError as exc:
             st = _http_status(exc)
             if 400 <= st < 500 and st != 429:
-                raise DriveError(f"Upload of '{name}' failed: {_explain_drive_http(st, exc)}", 502)
+                raise DriveError(f"Upload of '{name}' ({mode}) failed: {_explain_drive_http(st, exc)}", 502)
             last = exc
         except Exception as exc:
             last = exc
-        log.warning("Upload attempt %d/3 for %s failed: %s", attempt, name, last)
+        log.warning("Upload attempt %d/3 for %s (%s) failed: %s", attempt, name, mode, last)
         time.sleep(3 * attempt)
-    raise DriveError(f"Upload of '{name}' failed after 3 attempts: {type(last).__name__}", 502)
+    raise DriveError(f"Upload of '{name}' ({mode}) failed after 3 attempts: {type(last).__name__}", 502)
 
 
 def _upload_text(service: Any, text: str, name: str, folder_id: str) -> None:
@@ -391,6 +461,8 @@ class Job:
     folder_id: str
     pdf_name: str
     stem: str
+    output_pdf_file_id: Optional[str] = None
+    output_xlsx_file_id: Optional[str] = None
     workdir: str = ""
     pdf_path: str = ""
     legend_path: str = ""
@@ -578,8 +650,8 @@ def _pipeline(job: Job) -> Dict[str, Any]:
     _set_state(stage="uploading")
     svc = _drive_service()
     uploaded = [
-        _upload_file(svc, bom_path, job.bom_name, XLSX_MIME, job.folder_id),
-        _upload_file(svc, audit_path, job.audit_name, PDF_MIME, job.folder_id),
+        _upload_file(svc, bom_path, job.bom_name, XLSX_MIME, job.folder_id, job.output_xlsx_file_id),
+        _upload_file(svc, audit_path, job.audit_name, PDF_MIME, job.folder_id, job.output_pdf_file_id),
     ]
 
     return {
@@ -598,12 +670,20 @@ def _pipeline(job: Job) -> Dict[str, Any]:
 
 def _report_failure(job: Job, message: str) -> None:
     """Drop a small text file in the output folder so a silent failure is never invisible."""
+    from googleapiclient.errors import HttpError
     svc = _drive_service()
     text = (
         f"Takeoff FAILED\nFile: {job.pdf_name}\nJob: {job.job_id}\n"
         f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n\nReason: {message}\n"
     )
-    _upload_text(svc, text, f"TAKEOFF_FAILED_{job.stem}.txt", job.folder_id)
+    try:
+        _upload_text(svc, text, f"TAKEOFF_FAILED_{job.stem}.txt", job.folder_id)
+    except HttpError as exc:
+        if _http_status(exc) == 403:     # service account has no quota: create() is not possible
+            log.warning("Job %s: failure notice skipped (create() returned 403). Reason was: %s",
+                        job.job_id, message)
+            return
+        raise
 
 
 async def _run_job(job: Job) -> None:
@@ -638,7 +718,12 @@ def _preflight_request(req: TakeoffJobRequest) -> Dict[str, Any]:
     """Fast (~1-2 s) Drive access check so a bad ID or missing share fails NOW, not in 15 minutes."""
     cfg = SliceConfig()
     svc = _drive_service()
-    _check_folder(svc, req.finished_folder_id)
+    if not (req.output_pdf_file_id and req.output_xlsx_file_id):
+        _check_folder(svc, req.finished_folder_id)       # still needed for create() outputs
+    if req.output_pdf_file_id:
+        _check_placeholder(svc, req.output_pdf_file_id, "output_pdf_file_id")
+    if req.output_xlsx_file_id:
+        _check_placeholder(svc, req.output_xlsx_file_id, "output_xlsx_file_id")
     pdf_meta = _file_meta(svc, req.pdf_file_id, "pdf_file_id")
     pdf_size = _assert_downloadable(pdf_meta, "pdf_file_id", MAX_PDF_BYTES, "pdf")
     legend_meta = _file_meta(svc, req.legend_file_id, "legend_file_id")
@@ -680,6 +765,8 @@ async def process_takeoff(req: TakeoffJobRequest, background_tasks: BackgroundTa
             folder_id=req.finished_folder_id,
             pdf_name=req.pdf_filename,
             stem=_safe_stem(req.pdf_filename),
+            output_pdf_file_id=req.output_pdf_file_id,
+            output_xlsx_file_id=req.output_xlsx_file_id,
         )
         background_tasks.add_task(_run_job, job)
         scheduled = True
@@ -691,6 +778,10 @@ async def process_takeoff(req: TakeoffJobRequest, background_tasks: BackgroundTa
                 "job_id": job.job_id,
                 "pdf": job.pdf_name,
                 **info,
+                "output_mode": {
+                    "pdf": "update" if job.output_pdf_file_id else "create",
+                    "xlsx": "update" if job.output_xlsx_file_id else "create",
+                },
                 "outputs": [job.audit_name, job.bom_name],
                 "message": "Processing started. Results will appear in the finished folder.",
             },

@@ -272,33 +272,41 @@ def open_pdf(path: str, cfg: Optional[SliceConfig] = None) -> "fitz.Document":
     return doc
 
 
-def validate_legend_image(path: str, cfg: SliceConfig) -> Tuple[int, int]:
-    """
-    Cheap legend.png check: size cap, PNG signature, IHDR dimensions.
-    The image is NOT decoded (a big screenshot would cost 60+ MB of RAM).
-    Returns (width_px, height_px).
-    """
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        raise SliceError("Legend file is missing.", 400)
-    if size == 0:
-        raise SliceError("Legend file is empty.", 400)
+JPEG_MAGIC = b"\xff\xd8\xff"
+
+def validate_legend_image(legend_path: str, cfg: Optional[SliceConfig] = None) -> Tuple[int, int]:
+    """Validate that legend_path is a non-empty PNG or JPEG within size limits."""
+    cfg = cfg or SliceConfig()
+    if not legend_path or not os.path.isfile(legend_path):
+        raise SliceError("Legend image file not found.", 400)
+    size = os.path.getsize(legend_path)
+    if size < 24:
+        raise SliceError("Legend image is empty or truncated.", 415)
     if size > cfg.max_legend_bytes:
-        raise SliceError(f"Legend exceeds {cfg.max_legend_bytes // (1024 * 1024)} MB.", 413)
-    with open(path, "rb") as fh:
-        head = fh.read(24)
-    if len(head) < 24 or head[:8] != PNG_MAGIC or head[12:16] != b"IHDR":
-        raise SliceError("Legend must be a valid PNG image (legend.png).", 415)
-    width, height = struct.unpack(">II", head[16:24])
-    if width < 64 or height < 64:
-        raise SliceError("Legend image is too small to read (min 64x64 px).", 422)
-    if width * height > cfg.max_legend_pixels:
-        raise SliceError(
-            f"Legend is {width}x{height}px; limit is {cfg.max_legend_pixels:,} pixels. "
-            "Crop or downscale the screenshot.", 413,
-        )
-    return width, height
+        raise SliceError(f"Legend exceeds {cfg.max_legend_bytes // (1024 * 1024)} MB limit.", 413)
+
+    with open(legend_path, "rb") as fh:
+        head = fh.read(32)
+
+    # 1. Standard PNG check
+    if head.startswith(PNG_MAGIC) and head[12:16] == b"IHDR":
+        w, h = struct.unpack(">II", head[16:24])
+    # 2. Standard JPEG check (iPad cropped screenshots often save as JPEG)
+    elif head.startswith(JPEG_MAGIC):
+        doc = fitz.open(legend_path)
+        try:
+            rect = doc[0].rect
+            w, h = int(rect.width), int(rect.height)
+        finally:
+            doc.close()
+    else:
+        raise SliceError("Legend must be a valid PNG or JPEG image.", 415)
+
+    if w < 16 or h < 16:
+        raise SliceError(f"Legend dimensions too small ({w}x{h}).", 422)
+    if w * h > cfg.max_legend_pixels:
+        raise SliceError(f"Legend resolution ({w}x{h}) exceeds limit.", 413)
+    return w, h
 
 
 def load_page(doc: "fitz.Document", page_index: int) -> "fitz.Page":
